@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cloud-doc 1-bit video test (A: 셰이더 무수정)</title>
+<style>
+  body { background:#000; color:#ddd; font-family:system-ui,sans-serif; margin:16px; }
+  h1 { font-size:16px; font-weight:600; }
+  p, li { font-size:13px; line-height:1.6; }
+  #row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
+  canvas { background:#000; border:1px solid #333; image-rendering:pixelated; }
+  #view { width:960px; max-width:95vw; height:auto; }
+  #orig { width:320px; max-width:40vw; height:auto; }
+  .panel { border:1px solid #333; padding:10px 12px; margin-top:12px; max-width:1000px; }
+  .panel label { display:inline-block; margin:4px 12px 4px 0; font-size:13px; }
+  select, input[type=number] { background:#111; color:#ddd; border:1px solid #444; }
+  button { background:#1a1a1a; color:#ddd; border:1px solid #555; padding:4px 12px; cursor:pointer; }
+  #fps { font-variant-numeric:tabular-nums; }
+  code { color:#9cf; }
+</style>
+</head>
+<body>
+<h1>cloud-doc 1-bit video test — 셰이더 무수정, 데이터(den 맵·프리셋·파라미터)만 사용</h1>
+<p>왼쪽: 구름 셰이더 출력(mode=1). 오른쪽: 입력 이진 원본. 둘을 비교해 경계 지글거림·가독성을 본다.<br>
+흰=den +2.2 / 검정=den −2.0 (값 범위의 양끝 — billow 진폭 ±0.625를 안쪽에서 압도하는 동작점). 프리셋은 구름색 전부 흰, 하늘 전부 흰(far 퇴색 무력화), rim 0.</p>
+<div id="row">
+  <div><div>rendered</div><canvas id="view" width="960" height="540"></canvas></div>
+  <div><div>source (binary)</div><canvas id="orig" width="320" height="180"></canvas></div>
+</div>
+<div class="panel">
+  <label>패턴
+    <select id="pat">
+      <option value="badapple" selected>badapple 5s (실사)</option>
+      <option value="text">text HELLO 123</option>
+      <option value="square">moving square</option>
+      <option value="bars">scrolling bars</option>
+      <option value="checker">checker</option>
+      <option value="circle">pulse circle</option>
+    </select>
+  </label>
+  <label>doc 해상도
+    <select id="res">
+      <option value="80x45">80×45</option>
+      <option value="160x90" selected>160×90</option>
+      <option value="320x180">320×180</option>
+    </select>
+  </label>
+  <label>scale <select id="scale"><option>2</option><option>5.5</option><option selected>12</option></select></label>
+  <label>cov <select id="cov"><option>0.3</option><option selected>0.5</option><option>0.65</option></select></label>
+  <label>시간 <select id="tmode"><option value="frozen" selected>고정(끓음 없음)</option><option value="run">흐름(끓음 있음)</option></select></label>
+  <button id="play">⏸ 정지</button>
+  <span id="fps"></span>
+</div>
+<div class="panel">
+  판정 포인트:
+  <ol>
+    <li>정지 text가 깨끗이 읽히는지 (안쪽은 billow에 면역 — 수치상 보장, 경계만 ±0.27 texel 흔들림).</li>
+    <li>scale 12 ↔ 2 전환 시 경계 물결 파장이 어떻게 바뀌는지 (클수록 잘게 지글거림).</li>
+    <li>시간 흐름 모드에서 정지 화면이 끓는지 (uTime worley wobble — 동영상에선 꺼야 함).</li>
+    <li>해상도를 올리면 경계 회색대(1 texel 보간)가 상대적으로 얇아지는지.</li>
+    <li>FPS: 풀스크린 bake 1회당 ms — 실제 장면 통합 시 s(굽기 배율) 결정 근거.</li>
+  </ol>
+  실장면 통합 시 남은 작업(본 파일과 무관): 하늘 팔레트 흑화(투명 배경 뒤 비침), 오버레이 제거(BLOOM/DY_LIGHT/DC_LIGHT/반짝임/별/달/토리이/랜턴),
+  프레임마다 <code>upload('den')</code> + <code>render()</code> 호출 배선 — <code>CloudDoc.bake()</code>는 같은 doc 객체면 업로드를 건너뛰므로(<code>bakeDoc !== doc</code> 가드) 재사용 불가, 렌더러 직접 호출 필요.
+</div>
+<script src="cloud-doc.js"></script>
+<script src="video-test.js"></script>
+</body>
+</html>

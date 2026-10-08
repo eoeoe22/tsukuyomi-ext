@@ -83,7 +83,7 @@
                 MOON_F: 0.026, MOON_MIN: 12, MOON_MAX: 28,
                 // MOON_SIZE: 달(미러볼) 크기 배율. moonR 계산 마지막에 곱한다.
                 MOON_SIZE: 2,
-                TORII_SCALE: 0.7, TORII_X: 0.76, TORII_BASE: 0.75,
+                TORII_SCALE: 0.7, TORII_X: 0.5, TORII_BASE: 0.75,
                 // TORII_X는 토리이 중심과 달 중심이 공유하는 수직선 (항상 같은 x)
                 MOON_Y: 0.34,
                 STAR_DENS: 2400, STAR_MAX: 1600, STAR_A0: 0.64, STAR_A1: 0.86,
@@ -122,6 +122,10 @@
                 DAY_SCENE: 1,
                 // CLOUD_DOC: 1 = 브러시 구름 문서(디버그 패널 › 구름 › 브러시 구름 편집)가 있으면 황혼/새 낮 구름 대신 그린다, 0 = 항상 절차적 구름.
                 CLOUD_DOC: 1,
+                // 연속 프레임 재생(1비트 영상): VIDEO 1 = 황혼 슬롯을 정적 문서 대신 비트팩으로 재생.
+                // VIDEO_SRC: public/clouds/ 아래 팩, VIDEO_FPS 0 = 팩 지정 fps.
+                // VIDEO_TSPEED: 구름 배경 질감(billow) 시간 흐름 배율. 원본=1(uTime=실시간) 기준, 0 = 시간 고정(끓음 없음).
+                VIDEO: 1, VIDEO_SRC: 'ba-full.json', VIDEO_FPS: 0, VIDEO_TSPEED: 8,
                 // 절차적 구름 라이브(cloud-live.js): CL_LIVE 1 = GPU로 계속 다시 그림(0 = 예전처럼 CPU로 한 번 굽기, 재생성 필요),
                 // CL_RATE 변화 속도 배율, CL_BOIL 혹 끓음 세기, CL_WARP 윤곽 일렁임/타원 호 지우기, CL_RAND 경계 랜덤화(덮임 변동·침식),
                 // CL_HZ 스프라이트당 갱신 빈도, CL_UP 혹 음영에 섞는 위쪽 빛(0 = 해 방향만 → 세로 붓자국 줄무늬가 다시 생김)
@@ -1862,7 +1866,118 @@
                 if (!window.CloudDoc) return;
                 fetch(assetUrl('clouds/index.json'), { cache: 'no-cache' })
                     .then(r => r.ok ? r.json() : null).catch(() => null)
-                    .then(ix => { cloudIndex = ix || {}; for (const k of window.CloudDoc.SCENES) loadCloudDoc(k); });
+                    .then(ix => {
+                        cloudIndex = ix || {};
+                        for (const k of window.CloudDoc.SCENES) {
+                            if (k === 'dusk' && CFG.VIDEO >= 0.5) continue;   // dusk 슬롯은 비트팩 재생이 쓴다
+                            loadCloudDoc(k);
+                        }
+                        if (CFG.VIDEO >= 0.5) loadVideo();
+                    });
+            }
+
+            // ---------- 연속 프레임 재생 (1비트 흑백 영상, 셰이더 무수정) ----------
+            // 비트팩을 가져와 den에 직접 적재하고 CloudDoc 렌더러 공개 API로 매 스텝 다시 굽는다.
+            // 배경 질감 시간(uTime)은 프레임 스텝마다 VIDEO_TSPEED 배율로 전진한다 (원본 장면=1 기준).
+            // docCloud.dusk 파이프를 그대로 쓰므로 레터박스·랜턴컬링·틴트·반사가 그대로 적용된다.
+            // 팩 로드 실패 시 정적 문서로 폴백한다.
+            const video = { pack: null, frames: [], n: 0, idx: -1, acc: 0, t: 20, tLast: -1, R: null, ready: false, allocKey: '' };
+            const VID_W = 480, VID_H = 160;   // dusk 문서 스펙 (레터박스 VB_X 상수와 일치)
+            const VID_E_ON = 2.2, VID_E_OFF = -2.0;
+            function videoFPS() { return (CFG.VIDEO_FPS > 0 ? CFG.VIDEO_FPS : (video.pack && video.pack.fps)) || 8; }
+            function loadVideo() {
+                const file = CFG.VIDEO_SRC || 'ba-video.json';
+                fetch(assetUrl('clouds/' + file), { cache: 'no-cache' })
+                    .then(r => r.ok ? r.json() : Promise.reject(new Error(r.status)))
+                    .then(p => {
+                        if (!p || p.type !== 'tsukuyomi-video' || !Array.isArray(p.frames) || !p.frames.length) throw new Error('bad pack');
+                        if (!(p.w > 0) || !(p.h > 0) || (p.enc && p.enc !== 'rle16')) throw new Error('bad pack header');
+                        if (p.w > VID_W || p.h > VID_H) throw new Error('frame too large');
+                        video.pack = p;
+                        video.frames = p.frames;   // b64 문자열 보관, 디코드는 스텝마다 1장씩 (메모리 절약)
+                        video.n = p.frames.length;
+                        const D = docCloud.dusk;
+                        D.doc = {
+                            scene: 'dusk', w: VID_W, h: VID_H, horizon: 0, time: 20,
+                            params: { cov: 0.5, sharp: 0.01, soft: 0.05, scale: 12, absorb: 0.2, sun: 90, grain: 0 },
+                            den: new Float32Array(VID_W * VID_H), tr: new Float32Array(VID_W * VID_H),
+                        };
+                        D.src = 'video:' + file;
+                        if (!video.R) video.R = window.CloudDoc.createRenderer(document.createElement('canvas'), { alpha: true });
+                        if (!video.R.ok) throw new Error(video.R.error || 'renderer');
+                        sizeVideoRenderer();
+                        renderVideoFrame(0);
+                        video.ready = true;
+                    })
+                    .catch(e => { console.warn('비디오 팩 로드 실패, 정적 문서로 폴백: clouds/' + file, e); loadCloudDoc('dusk'); });
+            }
+            function sizeVideoRenderer() {
+                if (!video.R || !video.R.ok || !video.pack || !W || !HZ) return;
+                const s = Math.min(dpr, 1.5);
+                const cw = Math.max(1, Math.round(W * s)), ch = Math.max(1, Math.round(HZ * s));
+                if (video.R.canvas.width !== cw || video.R.canvas.height !== ch) {
+                    video.R.canvas.width = cw; video.R.canvas.height = ch;
+                }
+                const key = VID_W + 'x' + VID_H;
+                if (video.allocKey !== key) {
+                    video.R.alloc(VID_W, VID_H);
+                    video.R.upload('tr', docCloud.dusk.doc.tr);
+                    video.allocKey = key;
+                }
+                docCloud.dusk.spr = video.R.canvas;
+                bandValid = false;
+                // 캔버스 리사이즈로 내용이 지워졌으므로 현재 프레임을 강제 다시 그림
+                if (video.frames.length) {
+                    const cur = Math.max(0, video.idx);
+                    video.idx = -1;
+                    renderVideoFrame(cur);
+                }
+            }
+            // v1(비트팩, enc 없음) / v2(rle16) 공용 1장 디코더. 위쪽 행이 먼저인 0/1 배열 반환.
+            function decodeVideoFrame(p, b64) {
+                const total = p.w * p.h;
+                if (p.enc === 'rle16') {
+                    const s = atob(b64);
+                    const bin = new Uint8Array(total);
+                    let idx = 0, v = 0;
+                    for (let r = 0, n = s.length >> 1; r < n; r++) {
+                        const len = s.charCodeAt(r * 2) | (s.charCodeAt(r * 2 + 1) << 8);
+                        if (len < 0 || idx + len > total) throw new Error('rle overflow');
+                        bin.fill(v, idx, idx + len);
+                        idx += len; v ^= 1;
+                    }
+                    if (idx !== total) throw new Error('rle short');
+                    return bin;
+                }
+                const s = atob(b64);
+                if (s.length !== Math.ceil(total / 8)) throw new Error('frame size mismatch');
+                const bin = new Uint8Array(total);
+                for (let i = 0; i < total; i++) bin[i] = (s.charCodeAt(i >> 3) >> (7 - (i & 7))) & 1;
+                return bin;
+            }
+            function renderVideoFrame(i, t) {
+                if (!video.R || !video.R.ok || !video.frames.length || !W || !HZ) return;
+                const time = t ?? video.t;
+                if (i === video.idx && time === video.tLast) return;
+                const p = video.pack, sameFrame = (i === video.idx);
+                if (!sameFrame) {
+                    const bin = decodeVideoFrame(p, video.frames[i]), dx0 = (VID_W - p.w) >> 1;
+                    video.idx = i;
+                    const d = docCloud.dusk.doc.den;
+                    d.fill(VID_E_OFF);
+                    for (let y = 0; y < p.h; y++) for (let x = 0; x < p.w; x++)
+                        d[(VID_H - 1 - y) * VID_W + dx0 + x] = bin[y * p.w + x] ? VID_E_ON : VID_E_OFF;
+                    video.R.upload('den', d);
+                }
+                video.tLast = time;
+                const D = docCloud.dusk, doc = D.doc, s = Math.min(dpr, 1.5);
+                doc.time = time;
+                const f = window.CloudDoc.fit(doc, W, HZ), A = VID_W / VID_H;
+                video.R.render({
+                    rect: [f.ox * s, -doc.horizon * f.k * s, A * f.k * s, f.k * s],
+                    doc, preset: window.CloudDoc.PRESETS[doc.scene], mode: 1, view: 0, time,
+                });
+                D.spr = video.R.canvas;
             }
             // 에디터(다른 탭)에서 적용/해제하면 바로 반영
             window.addEventListener('storage', e => {
@@ -2074,20 +2189,33 @@
             }
             function drawFarLanterns(a, night) {
                 if (!farCount || a <= 0.01) return;
+                const vb = videoBars();
+                // 레터박스 바깥은 버린다: 전폭 버퍼에서 중앙 구간만 잘라 그린다 (vb 없으면 전폭 그대로)
+                const nat = (c, img, dy) => {
+                    if (!vb) { c.drawImage(img, 0, dy); return; }
+                    const sx = vb[0] / W * img.width, sw = (vb[1] - vb[0]) / W * img.width;
+                    c.drawImage(img, sx, 0, sw, img.height, sx, dy, sw, img.height);
+                };
+                const scl = (c, img, dy, dw, dh) => {
+                    if (!vb) { c.drawImage(img, 0, dy, dw, dh); return; }
+                    const f0 = vb[0] / W, f1 = vb[1] / W;
+                    c.drawImage(img, f0 * img.width, 0, (f1 - f0) * img.width, img.height,
+                        f0 * dw, dy, (f1 - f0) * dw, dh);
+                };
                 ctx.setTransform(1, 0, 0, 1, 0, 0);
                 ctx.globalCompositeOperation = 'source-over';
                 ctx.globalAlpha = a;
-                ctx.drawImage(farReflC, 0, Math.round(farReflTop * dpr));
+                nat(ctx, farReflC, Math.round(farReflTop * dpr));
                 ctx.globalAlpha = 1;
                 ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
                 FG.setTransform(1, 0, 0, 1, 0, 0);
                 FG.globalCompositeOperation = 'source-over';
                 FG.globalAlpha = a;
-                FG.drawImage(farBodyC, 0, Math.round(farTop * dpr));
+                nat(FG, farBodyC, Math.round(farTop * dpr));
                 if (night > 0.01) {
                     FG.globalCompositeOperation = 'lighter';
                     FG.globalAlpha = a * 0.45 * night * CFG.LANTERN_GLOW;
-                    FG.drawImage(farBodyC, 0, Math.round(farTop * dpr));
+                    nat(FG, farBodyC, Math.round(farTop * dpr));
                     // 번짐: 축소 캔버스를 원래 크기로 늘려 그리면 부드럽게 퍼진다
                     const bl = a * night * CFG.LANTERN_GLOW * Math.max(0, CFG.LANTERN_FAR_BLOOM ?? 1);
                     if (bl > 0.005) {
@@ -2095,9 +2223,9 @@
                         const bw = farBodyC.width, bh = farBodyC.height + FAR_BLOOM_PAD * 2 * dpr;
                         FG.imageSmoothingEnabled = true;
                         FG.globalAlpha = Math.min(1, bl * 1.1);
-                        FG.drawImage(farBloomA, 0, by, bw, bh);
+                        scl(FG, farBloomA, by, bw, bh);
                         FG.globalAlpha = Math.min(1, bl * 1.4);
-                        FG.drawImage(farBloomB, 0, by, bw, bh);
+                        scl(FG, farBloomB, by, bw, bh);
                     }
                     FG.globalCompositeOperation = 'source-over';
                 }
@@ -2313,7 +2441,10 @@
                 }
                 pole = { x: W * CFG.POLE_X, y: HZ * CFG.POLE_Y };
                 placeDuskCb();
-                for (const k in docCloud) bakeCloudDoc(k);
+                for (const k in docCloud) {
+                    if (k === 'dusk' && CFG.VIDEO >= 0.5 && video.pack) sizeVideoRenderer();
+                    else bakeCloudDoc(k);
+                }
                 const m = Math.min(W, H);
                 sunR = clamp(m * CFG.SUN_F, CFG.SUN_MIN, CFG.SUN_MAX);
                 moonR = clamp(m * CFG.MOON_F, CFG.MOON_MIN, CFG.MOON_MAX) * (CFG.MOON_SIZE ?? 1);
@@ -2443,6 +2574,23 @@
                         if (!c.spr) continue;
                         const G = day2Geom(c, base);
                         if (G.dx > W) c.xn = (-G.tw - 8 + G.px) / W;
+                    }
+                }
+
+                // 연속 프레임 재생: 고정 fps로 den을 갈아끼우고 다시 굽는다 (동작 줄이기 설정이면 첫 장면 정지).
+                // 배경 질감 시간도 같은 스텝에 VIDEO_TSPEED 배율로 전진 — 렌더 횟수는 그대로라 추가 비용 없음.
+                if (CFG.VIDEO >= 0.5 && video.ready && !RM.matches) {
+                    video.acc += dt;
+                    const vstep = 1 / Math.max(1, videoFPS());
+                    if (video.acc >= vstep) {
+                        video.acc = video.acc % vstep;
+                        video.t += vstep * Math.max(0, CFG.VIDEO_TSPEED ?? 8);
+                        try { renderVideoFrame((video.idx + 1) % video.n, video.t); }
+                        catch (e) {
+                            console.warn('비디오 프레임 디코드 실패, 정지 후 정적 문서로 폴백', e);
+                            CFG.VIDEO = 0; video.ready = false;
+                            loadCloudDoc('dusk');
+                        }
                     }
                 }
 
@@ -2771,6 +2919,35 @@
                     S.closePath();
                     S.fill();
                 }
+
+                // 영상 문서 좌우 레터박스: ba-5s-dusk.json(480×160, 실사 214px 중앙) 전용.
+                // 문서 pillar는 투명이라 하늘이 비쳐 프레임 경계가 잘린 듯 보이므로, 실사 바깥을 검정 바로 덮는다.
+                // S(하늘 캔버스)에 그려 수면 반사에도 그대로 미러되고, 토리이(FG 레이어)보다 아래에 깔린다.
+                // 밤이 되어 구름이 사라지면 바도 함께 사라진다(videoBars 내부 dLive 게이트).
+                // 같은 범위를 랜턴 컬링(drawLanterns/drawFarLanterns)도 공유한다.
+                const vb = videoBars();
+                if (vb) {
+                    S.fillStyle = '#000';
+                    S.fillRect(0, 0, vb[0], HZ);
+                    S.fillRect(vb[1], 0, W - vb[1], HZ);
+                }
+            }
+
+            // 황혼 영상 문서(480×160)의 실사 구간 화면 좌표. 문서가 바뀌면 VB_X 상수도 함께 갱신 필요.
+            // ba-5s-dusk.json: 214px 실사를 480폭 중앙에 배치 → u 133/480 ~ 347/480.
+            const VB_X0 = 133 / 480, VB_X1 = 347 / 480;
+            function videoBars() {
+                if (!(CFG.CLOUD_DOC >= 0.5)) return null;
+                const D = docCloud.dusk;
+                if (!D || !D.doc || !D.spr || D.doc.w !== 480 || D.doc.h !== 160) return null;
+                // 구름이 페이드아웃되면 바도 없다 (랜턴 컬링과 공유하는 단일 진실 공급원)
+                const live = (1 - sunVis) * (1 - ss(CFG.DC_F0, CFG.DC_F1, palQ()));
+                if (live <= 0.01) return null;
+                const A = D.doc.w / D.doc.h;
+                const f = window.CloudDoc.fit(D.doc, W, HZ);
+                const x0 = f.ox + VB_X0 * A * f.k, x1 = f.ox + VB_X1 * A * f.k;
+                if (x1 <= 0 || x0 >= W || x1 - x0 <= 0) return null;
+                return [Math.max(0, x0), Math.min(W, x1)];
             }
 
             // ---------- reflection adaptive step ----------
@@ -2877,6 +3054,9 @@
             function drawLanterns(r0, r1, a = 1, pass = 'all') {
                 if (!lanReady || !lanterns.length || !lanCW) return;
                 if (a <= 0.01) return;
+                const vb = videoBars();
+                // 레터박스 밖으로 몸통 전체가 넘어간 랜턴은 그리지 않는다 (반사·글로우·바닥 빛 포함 통째로 스킵)
+                const outVB = L => vb && (L.x + L.w / 2 < vb[0] || L.x - L.w / 2 > vb[1]);
                 const inPass = pass === 'all' ? () => true
                     : pass === 'back' ? L => L.y <= torBase : L => L.y > torBase;
                 const reflH = Math.max(1, H - HZ);
@@ -2891,7 +3071,7 @@
                 ctx.globalCompositeOperation = 'source-over';
                 // reflections, far-to-near
                 for (const L of lanterns) {
-                    if (L.w < 2 || L.h < 3 || !inPass(L)) continue;
+                    if (L.w < 2 || L.h < 3 || !inPass(L) || outVB(L)) continue;
                     if (L.x + L.w / 2 < -20 || L.x - L.w / 2 > W + 20) continue;
                     if (L.y < HZ - 2) continue;
                     const dh = Math.min(L.h * LAN_FEET, H - L.y);
@@ -2928,7 +3108,7 @@
                 FG.globalCompositeOperation = 'source-over';
                 FG.globalAlpha = a;
                 for (const L of lanterns) {
-                    if (L.w < 2 || L.h < 3 || !inPass(L)) continue;
+                    if (L.w < 2 || L.h < 3 || !inPass(L) || outVB(L)) continue;
                     if (L.x + L.w / 2 < -L.w || L.x - L.w / 2 > W + L.w) continue;
                     const top = L.y - L.h * LAN_FEET;
                     FG.drawImage(lanC, L.x - L.w / 2, top, L.w, L.h);
